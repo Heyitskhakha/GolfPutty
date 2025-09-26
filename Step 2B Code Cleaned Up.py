@@ -15,7 +15,13 @@ import numpy as np
 import cv2
 
 from math import atan2, sqrt, degrees
+def camera_instrinic_parameters(calibration_file_path):
 
+    cv_file = cv2.FileStorage(calibration_file_path, cv2.FILE_STORAGE_READ)
+
+    CAMERA_MTX = cv_file.getNode("camera_matrix").mat()
+    DIST_COEFFS = cv_file.getNode("dist_coeff").mat()
+    return CAMERA_MTX , DIST_COEFFS
 
 pipeline = rs.pipeline()
 config = rs.config()
@@ -41,26 +47,50 @@ objp[:, :2] = np.mgrid[0:PATTERN[0], 0:PATTERN[1]].T.reshape(-1, 2) * INTRINSIC_
 
 calibration_file = r"C:/Users/skha/PycharmProjects/GolfPutty/CalibrationFiles/RoboDK-Camera-Settings.yaml"
 
-file = calibration_file
-cv_file = cv2.FileStorage(file, cv2.FILE_STORAGE_READ)
-
-CAMERA_MTX = cv_file.getNode("camera_matrix").mat()
-DIST_COEFFS = cv_file.getNode("dist_coeff").mat()
-mtx = CAMERA_MTX
-dist = DIST_COEFFS
-
 RDK=Robolink()
 camera= RDK.Item('My Camera')
 cam_item = RDK.Item('My Camera')
-print(cam_item.Pose())
+
 robot = RDK.Item("Doosan Robotics H2515")
 Tool_1=RDK.Item('Tool 1')
 Tool_2=RDK.Item('Tool 2')
 robot.setPoseTool(Tool_1)
-print('mtx:',mtx)
+
 Starting_pose= RDK.Item('Home')
 robot.MoveJ(Starting_pose)
+mtx , dist = camera_instrinic_parameters(calibration_file)
 
+def return_robot_pose(rvec, tvec):
+    R_cam_robot = np.array([
+        [-1, 0, 0],
+        [0, 1, 0],
+        [0, 0, -1]
+    ])
+    Robot_Pose = robot.Pose()
+    print('Robot_Pose:', Robot_Pose.Rot33())
+    # Object rotation in camera frame
+    R_obj_cam, _ = cv2.Rodrigues(rvec)  # convert rotation matrix
+    t_obj_cam = tvec.reshape(3, 1)  # converts to a [3,1] array
+
+    # Convert object to robot frame
+    R_obj_robot = Robot_Pose.Rot33() @ R_obj_cam
+    t_obj_robot = R_cam_robot @ t_obj_cam #using R_cam_robot seems have better accuracy than using the Robot_pose.Rot33()
+    print('R_obj_robot:', R_obj_robot)
+    # Homogeneous transform of object in robot coordinates
+    T_obj_robot = np.eye(4)
+    T_obj_robot[:3, :3] = R_obj_robot
+    T_obj_robot[:3, 3] = t_obj_robot.flatten()
+    # Only translate — keep the current rotation
+    T_obj_in_robot_base = np.eye(4)
+    T_obj_in_robot_base[:3, :3] = R_obj_robot  # robot's current rotation
+    T_obj_in_robot_base[:3, 3] = Robot_Pose.Pos() + t_obj_robot.flatten() + [2, 0, 0]  # add translation only
+
+    # Convert to RoboDK Mat
+    Pose_obj_in_robot_mat = Mat(T_obj_in_robot_base.tolist())
+
+    return Pose_obj_in_robot_mat
+
+    # print('Marker_pose:',Marker_pose.Pose())
 
 def find_chessboard(img, mtx, dist, chess_size, squares_edge, refine=True, draw_img=None):
     """
@@ -96,31 +126,36 @@ def find_chessboard(img, mtx, dist, chess_size, squares_edge, refine=True, draw_
     rvec = np.array(rvec, dtype=np.float64).reshape(3, 1)
     tvec = np.array(tvec, dtype=np.float64).reshape(3, 1)
     rvec[:] = np.round(rvec, 3)
-    print("rvec:",rvec)
-    print("tvec:",tvec)
+    #print("rvec:",rvec)
+    #print("tvec:",tvec)
     return corners, rvec, tvec
 
+def grab_camera_view(camera_type):
+    if(camera_type=="intel"):
+        frames = pipeline.wait_for_frames()
+        # depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame()
+        # Convert to numpy
+        # depth_image = np.asanyarray(depth_frame.get_data())
+        color_image = np.asanyarray(color_frame.get_data())
+        gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+    elif(camera_type=="robodk"):
+        # RoboDK CAMERA
+        bytes_img = camera.RDK().Cam2D_Snapshot('', camera)
+        nparr = np.frombuffer(bytes_img, np.uint8)
+        Img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        color_image = Img
+        gray = cv2.cvtColor(Img, cv2.COLOR_BGR2GRAY)
+    else:
+        print('no camera selected')
+        exit()
+    return gray,color_image
 while True:
+    gray,color_image=grab_camera_view('robodk')
+    corners,rvec,tvec=find_chessboard(gray, mtx, dist, INTRINSIC_CHESS_SIZE, 30, refine=True, draw_img=None)
+    # Finding ChesseBoard for Testing
     '''
-    frames = pipeline.wait_for_frames()
-    #depth_frame = frames.get_depth_frame()
-    color_frame = frames.get_color_frame()
-    # Convert to numpy
-    #depth_image = np.asanyarray(depth_frame.get_data())
-    color_image = np.asanyarray(color_frame.get_data())
-    gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-
-    '''
-    #RoboDK CAMERA
-    bytes_img = camera.RDK().Cam2D_Snapshot('', camera)
-    nparr = np.frombuffer(bytes_img, np.uint8)
-    Img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    color_image=Img
-    gray = cv2.cvtColor(Img, cv2.COLOR_BGR2GRAY)
-
-    pattern = np.subtract(INTRINSIC_CHESS_SIZE, (1, 1))  # number of corners
     ret, corners = cv2.findChessboardCorners(gray, pattern)
-
     if ret:
         rcorners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1),
                                    (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
@@ -140,65 +175,21 @@ while True:
     #cv2.imshow('Original image', frame)
     #cv2.waitKey(0)
     corners,rvec,tvec=find_chessboard(gray, mtx, dist, INTRINSIC_CHESS_SIZE, 30, refine=True, draw_img=None)
-
     rvec, tvec = cv2.solvePnPRefineLM(objp, corners, CAMERA_MTX, DIST_COEFFS, rvec, tvec)
     imgpts, _ = cv2.projectPoints(objp, rvec, tvec, mtx, dist)
-    axis_length = 50
-    #cv2.drawFrameAxes(color_image, mtx, dist, rvec, tvec, axis_length)
-    # Draw projected points on the image
-    proj_img = color_image.copy()
-    for pt in imgpts:
-        x, y = pt.ravel()
-        cv2.circle(color_image, (int(round(x)), int(round(y))), 5, (0, 0, 255), -1)
+    '''
+
     #print("rvec:", rvec.ravel())
-    #print("first objp points (units mm):")
-
-    #for i in range(6):
-    #    print(i, corners[i].ravel())
-    #    pass
-    if rcorners is not None:
-        marker_length = INTRINSIC_SQUARE_SIZE
-
-        # Camera to Robot axis conversion
-        R_cam_robot = np.array([
-            [-1, 0, 0],
-            [0, 1, 0],
-            [0, 0, -1]
-        ])
-        Robot_Pose = robot.Pose()
-        print('Robot_Pose:',Robot_Pose.Rot33())
-        # Object rotation in camera frame
-        R_obj_cam, _ = cv2.Rodrigues(rvec) #convert rotation matrix
-        t_obj_cam = tvec.reshape(3, 1)#converts to a [3,1] array
-
-        # Convert object to robot frame
-        R_obj_robot = Robot_Pose.Rot33() @ R_obj_cam
-        t_obj_robot = R_cam_robot@ t_obj_cam
-        print('R_obj_robot:',R_obj_robot)
-        # Homogeneous transform of object in robot coordinates
-        T_obj_robot = np.eye(4)
-        T_obj_robot[:3, :3] = R_obj_robot
-        T_obj_robot[:3, 3] = t_obj_robot.flatten()
-        # Only translate — keep the current rotation
-        T_obj_in_robot_base = np.eye(4)
-        T_obj_in_robot_base[:3, :3] = R_obj_robot # robot's current rotation
-        T_obj_in_robot_base[:3, 3] = Robot_Pose.Pos() + t_obj_robot.flatten() +[2,0,0] # add translation only
-
-        # Convert to RoboDK Mat
-        Pose_obj_in_robot_mat = Mat(T_obj_in_robot_base.tolist())
-        # Move Marker
-        Marker_pose = RDK.Item('Marker')
-        Marker_pose.setPose(Pose_obj_in_robot_mat)
-        print('Pose_obj_in_robot_mat:', Pose_obj_in_robot_mat)
-
-        #print('Marker_pose:',Marker_pose.Pose())
-        robot.setPoseTool(Tool_2)
-        robot.MoveL(Marker_pose)
+    Robot_Pose = return_robot_pose(rvec, tvec)
+    Marker_pose = RDK.Item('Marker')
+    Marker_pose.setPose(Robot_Pose)
+    print('Pose_obj_in_robot_mat:', Robot_Pose)
+    robot.MoveL(Marker_pose)
 
 
-        cv2.imshow("Marker Pose", color_image)
-        cv2.waitKey(0)
-        exit()
+    cv2.imshow("Marker Pose", color_image)
+    cv2.waitKey(0)
+    exit()
 
 
 
